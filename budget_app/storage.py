@@ -44,7 +44,7 @@ def _atomic_write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascli=False) + "\n") 
+            f.write(json.dumps(row, ensure_ascii=False) + "\n") 
         f.flush()
         os.fsync(f.fileno()) # OS 버퍼까지 디스크에 강제 기록
     os.replace(tmp, path) # 교체
@@ -65,7 +65,7 @@ class TransactionRepository:
         """맨 뒤에 한 줄 추가. 전체 재작성 불필요 -> 빠름"""
         self.path.parent.mkdir(parents=True, exist_ok = True)
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(tx.to_dict(), ensure_ascli=False) + "\n") 
+            f.write(json.dumps(tx.to_dict(), ensure_ascii=False) + "\n") 
 
     def delete(self, tx_id: str) -> bool:
         """ id 일치하는 것만 빼고 전부 다시 씀(원자적). 실제로 지웠다면 True 반환"""
@@ -82,13 +82,95 @@ class TransactionRepository:
 
         _atomic_write_jsonl(self.path, kept())
         return found
+    
     def update(self, tx_id: str, changes: dict) -> bool:
         """id 찾아 changes 병합 후, 전체 재작성. 찾았으면 True"""
         found = False
         def updated() -> Iterator[dict]:
             nonlocal found
+
             for d in _iter_jsonl(self.path):
                 if d["id"] == tx_id:
                     found = True
                     d = {**d, **changes} # 기존 위에 변경분 덮기
                     Transaction.from_dict(d) # 검증: 잘못된 수정이면 여기서 걸린다.
+                yield d
+        _atomic_write_jsonl(self.path, updated())
+        return found
+
+    def next_id(self) -> str :
+        """가장 큰 번호 + 1. 스트리밍으로 흝으며 최대값만 기억"""
+        max_n = 0
+        for d in _iter_jsonl(self.path) :
+            try:
+                n = int(str(d["id"]).split("-")[1])
+            except (IndexError, ValueError) :
+                continue
+            max_n = max(max_n, n)
+
+        return f"TX-{max_n + 1:06d}"
+
+# ---------- 카테고리 저장소 ----------
+
+class CategoryStore :
+    def __init__(self, data_dir: Path) -> None :
+        self.path = data_dir / "categories.jsonl"
+        if not self.path.exists() :
+            self._seed() # 파일 없으면 기본 카테고리 자동 생성
+
+    def _seed(self) -> None :
+        _atomic_write_jsonl(self.path, ({"name": c} for c in DEFAULT_CATEGORIES))
+
+    def list(self) -> list[str] :
+        return [d["name"] for d in _iter_jsonl(self.path)]
+
+    def add(self, name: str) -> bool :
+        """이미 있으면 False, 새로 추가하면 True"""
+        if name in self.list() :
+            return False
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"name": name}, ensure_ascii=False) + "\n")
+        return True
+
+    def remove(self, name: str) -> bool :
+        """순수 삭제만. '사용 중이면 막기'는 서비스 계층 책임."""
+        cats = self.list()
+        if name not in cats:
+            return False
+        _atomic_write_jsonl(self.path, ({"name": c} for c in cats if c != name))
+
+        return True
+
+# ---------- 예산 저장소 ----------
+
+class BudgetStore :
+    def __init__(self, data_dir: Path) -> None :
+        self.path = data_dir / "budgets.jsonl"
+
+    def get(self, month: str) -> Budget | None :
+        for d in _iter_jsonl(self.path) :
+            if d["month"] == month :
+                return Budget.from_dict(d)
+
+        return None
+
+    def set(self, budget: Budget) -> None :
+        """같은 month 있으면 교체, 없으면 추가(upsert). 원자적 재작성"""
+        replaced = False
+
+        def rows() -> Iterator[dict] :
+            nonlocal replaced
+            for d in _iter_jsonl(self.path) :
+                if d["month"] == budget.month :
+                    replaced = True
+                    yield budget.to_dict() # 기존 월 -> 새 값으로 교체
+                else : 
+                    yield d
+
+            if not replaced :
+                yield budget.to_dict()  # 없던 월이면 끝에 추가
+
+        _atomic_write_jsonl(self.path, rows())
+
+
+
