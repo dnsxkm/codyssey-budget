@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from budget_app.errors import AppError
 from budget_app.models import Transaction, Budget
 
 # 카테고리 파일이 없을 때 자동 생성할 기본값 
@@ -28,11 +29,14 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
     if not path.exists():
         return 
     with path.open("r", encoding="utf-8") as f:
-        for line in f:  # 파일 객체 전체가 '줄 단위 이터레이터'
+        for line_no, line in enumerate(f, start=1):  # 파일 객체 전체가 '줄 단위 이터레이터'
             line = line.strip()
             if not line :   # 빈 줄은 건너뛰기
                 continue
-            yield json.loads(line)
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                raise _corrupt(path, line_no)
 
 def _atomic_write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     """ 임시 파일에 전부 쓴 뒤 원자적으로 교체한다.
@@ -42,13 +46,22 @@ def _atomic_write_jsonl(path: Path, rows: Iterable[dict]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True) # data 폴더 보장
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n") 
-        f.flush()
-        os.fsync(f.fileno()) # OS 버퍼까지 디스크에 강제 기록
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno()) # OS 버퍼까지 디스크에 강제 기록
+    except BaseException:
+        tmp.unlink(missing_ok=True) # 검증 실패 등으로 중단되면 임시 파일 정리 (원본은 그대로)
+        raise
     os.replace(tmp, path) # 교체
 
+
+
+def _corrupt(path: Path, n: int) -> AppError:
+    return AppError(f"데이터 파일이 손상되었습니다: {path} ({n}번째 레코드)",
+                    "해당 줄을 직접 고치거나 삭제한 뒤 다시 실행하세요.")
 
 
 # ---------- 거래 저장소 ---------- 
@@ -58,8 +71,12 @@ class TransactionRepository:
 
     def stream(self) -> Iterator[Transaction]:
         """저장 순서(오래된 -> 최신)대로 한 건씩 스트리밍"""
-        for d in _iter_jsonl(self.path):
-            yield Transaction.from_dict(d)
+        for n, d in enumerate(_iter_jsonl(self.path), start=1):
+            try:
+                tx = Transaction.from_dict(d)
+            except (KeyError, TypeError, ValueError):
+                raise _corrupt(self.path, n)
+            yield tx
 
     def append(self, tx: Transaction) -> None:
         """맨 뒤에 한 줄 추가. 전체 재작성 불필요 -> 빠름"""
@@ -115,8 +132,8 @@ class TransactionRepository:
 class CategoryStore :
     def __init__(self, data_dir: Path) -> None :
         self.path = data_dir / "categories.jsonl"
-        if not self.path.exists() :
-            self._seed() # 파일 없으면 기본 카테고리 자동 생성
+        if not self.list() :
+            self._seed() # 파일이 없거나 비어 있으면 기본 카테고리 자동 생성
 
     def _seed(self) -> None :
         _atomic_write_jsonl(self.path, ({"name": c} for c in DEFAULT_CATEGORIES))
